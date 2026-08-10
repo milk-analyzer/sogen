@@ -1254,12 +1254,20 @@ namespace sogen
 
             auto region = this->memory.get_region_info(address);
 
-            // [UNPACK] VMProtect self-modification: a protection fault writing to a read-only page inside
-            // the main image (the VM decrypting its own .R}q handlers / later the original .text before
-            // the OEP jump). Trace above confirmed the write pointer is a legit walking pointer, so grant
-            // write and retry to let the unpack proceed. (Unmapped faults are NOT handled here -> divergence.)
-            if (type == memory_violation_type::protection && address >= 0x140000000ull &&
-                address < 0x141a9c000ull && region.is_committed && !region.permissions.is_guarded())
+            // [UNPACK] VMProtect self-modification: a protection fault WRITING to a read-only page inside
+            // the target image (the VM decrypting its own handlers, later the original .text before the
+            // OEP jump). Grant write and retry so the unpack proceeds. (Unmapped faults are NOT handled
+            // here -> divergence.)
+            //
+            // The window comes from the module the OEP hook armed on, so it follows the target rather
+            // than one sample's base. g_unpack_base is only ever set under SOGEN_UNPACK, so the != 0
+            // test also keeps an ordinary sogen run on exactly the upstream path.
+            //
+            // Restricting to writes matters: a read or fetch fault cannot be cleared by granting write,
+            // and `restart` would then re-fault forever on the same address.
+            if (type == memory_violation_type::protection && is_writable(operation) && g_unpack_base != 0 &&
+                address >= g_unpack_base && address < g_unpack_base + g_unpack_size && region.is_committed &&
+                !region.permissions.is_guarded() && !is_writable(region.permissions.common))
             {
                 static uint64_t s_grants = 0;
                 const uint64_t page = address & ~static_cast<uint64_t>(0xFFF);
@@ -1474,25 +1482,47 @@ namespace sogen
         //   SOGEN_STOP_AT_OEP=1   freeze at OEP (clean unpacked snapshot) instead of running the payload
         //   SOGEN_OEP_RVA=0x..    force the OEP RVA (override the heuristic)
         //   SOGEN_LATEDUMP_AT=N   also dump image+heap after N post-OEP basic blocks (runtime-decrypted config)
-        const auto dump_mem = [this](const char* path, uint64_t lo, uint64_t sz) {
-            if (FILE* fo = fopen(path, "wb"))
+        // Returns false if the image could not be written in full. The caller must then skip the meta:
+        // a meta describing a file that does not match it is worse than no dump at all, because every
+        // check the wrapper performs would still pass.
+        const auto dump_mem = [this](const char* path, uint64_t lo, uint64_t sz) -> bool {
+            FILE* fo = fopen(path, "wb");
+            if (!fo)
             {
-                uint8_t pg[0x1000];
-                uint64_t good = 0;
-                for (uint64_t off = 0; off < sz; off += 0x1000)
-                {
-                    memset(pg, 0, sizeof(pg));
-                    if (this->memory.try_read_memory(lo + off, pg, sizeof(pg)))
-                    {
-                        ++good;
-                    }
-                    fwrite(pg, 1, sizeof(pg), fo);
-                }
-                fclose(fo);
-                this->log.error("[UNPACK] dumped %s : %llu/%llu pages [0x%llx +0x%llx]\n", path,
-                                static_cast<unsigned long long>(good), static_cast<unsigned long long>(sz / 0x1000),
-                                static_cast<unsigned long long>(lo), static_cast<unsigned long long>(sz));
+                this->log.error("[UNPACK] cannot open %s for writing\n", path);
+                return false;
             }
+            uint8_t pg[0x1000];
+            uint64_t good = 0;
+            uint64_t pages = 0;
+            bool ok = true;
+            for (uint64_t off = 0; off < sz && ok; off += 0x1000)
+            {
+                // The image is not necessarily a page multiple; writing whole pages would make the
+                // file larger than SizeOfImage and trip the wrapper's length check.
+                const size_t n = (sz - off) < 0x1000 ? static_cast<size_t>(sz - off) : 0x1000;
+                memset(pg, 0, sizeof(pg));
+                if (this->memory.try_read_memory(lo + off, pg, n))
+                {
+                    ++good;
+                }
+                ++pages;
+                ok = fwrite(pg, 1, n, fo) == n;
+            }
+            if (fclose(fo) != 0)
+            {
+                ok = false;
+            }
+            if (!ok)
+            {
+                this->log.error("[UNPACK] write failed for %s (disk full?) - removing the partial file\n", path);
+                remove(path);
+                return false;
+            }
+            this->log.error("[UNPACK] dumped %s : %llu/%llu pages [0x%llx +0x%llx]\n", path,
+                            static_cast<unsigned long long>(good), static_cast<unsigned long long>(pages),
+                            static_cast<unsigned long long>(lo), static_cast<unsigned long long>(sz));
+            return true;
         };
 
         // Arm address (memory-range) execution hooks on the target's ORIGINAL code sections when it loads.
@@ -1517,6 +1547,10 @@ namespace sogen
             const uint64_t base = mod.image_base;
             const uint64_t size = mod.size_of_image;
             const uint64_t entry_rva = mod.entry_point - base;
+            // Published here, not at OEP time: the self-modification write-grant above needs the window
+            // for the whole unpack, which happens long before the OEP is reached.
+            g_unpack_base = base;
+            g_unpack_size = size;
             const char* forced = std::getenv("SOGEN_OEP_RVA");
             const uint64_t frva = forced ? std::strtoull(forced, nullptr, 0) : 0;
             this->log.error("[UNPACK] target=%s base=0x%llx size=0x%llx entry_rva=0x%llx -> arming OEP hooks\n",
@@ -1542,6 +1576,47 @@ namespace sogen
                     oep_sec = &section;
                 }
             }
+            const auto oep_cb = [this, dump_mem, base, size, entry_rva](cpu_interface& cpu, uint64_t address) {
+                (void)cpu;
+                const std::scoped_lock lock(this->kernel_lock_);
+                if (g_unpack_oep)
+                {
+                    return;
+                }
+                g_unpack_oep = true;
+                this->log.error("[UNPACK] OEP=0x%llx (rva 0x%llx) -> dumping unpacked image\n",
+                                static_cast<unsigned long long>(address),
+                                static_cast<unsigned long long>(address - base));
+                if (!dump_mem("C:\\dumps\\unpacked.bin", base, size))
+                {
+                    this->log.error("[UNPACK] image dump failed -> not writing unpacked.meta\n");
+                }
+                else if (FILE* fm = fopen("C:\\dumps\\unpacked.meta", "w"))
+                {
+                    fprintf(fm, "base=0x%llx\nsize_of_image=0x%llx\nentry_rva=0x%llx\noep_rva=0x%llx\n",
+                            static_cast<unsigned long long>(base), static_cast<unsigned long long>(size),
+                            static_cast<unsigned long long>(entry_rva),
+                            static_cast<unsigned long long>(address - base));
+                    fclose(fm);
+                }
+                if (std::getenv("SOGEN_STOP_AT_OEP") != nullptr)
+                {
+                    // Emulator-wide, not this vCPU: cpu.stop() leaves should_stop clear, so execution
+                    // can resume past the OEP - the one thing this variable exists to prevent.
+                    this->stop();
+                }
+            };
+
+            if (forced)
+            {
+                // An exact address, not "somewhere in the section containing it". Selecting a section
+                // reproduces the very misfire this override exists to correct - and for a merged
+                // single-section build it re-arms on the packer stub itself.
+                this->log.error("[UNPACK] forcing OEP rva=0x%llx (exact address hook)\n",
+                                static_cast<unsigned long long>(frva));
+                this->emu().hook_memory_execution(base + frva, oep_cb);
+                return;
+            }
             if (oep_sec == nullptr)
             {
                 this->log.error("[UNPACK] no OEP section found -> set SOGEN_OEP_RVA to the real code RVA\n");
@@ -1550,34 +1625,7 @@ namespace sogen
             this->log.error("[UNPACK] arming OEP section %s rva=0x%llx len=0x%llx\n", oep_sec->name.c_str(),
                             static_cast<unsigned long long>(oep_sec->region.start - base),
                             static_cast<unsigned long long>(oep_sec->region.length));
-            this->emu().hook_memory_range_execution(
-                oep_sec->region.start, oep_sec->region.length,
-                [this, dump_mem, base, size, entry_rva](cpu_interface& cpu, uint64_t address) {
-                    const std::scoped_lock lock(this->kernel_lock_);
-                    if (g_unpack_oep)
-                    {
-                        return;
-                    }
-                    g_unpack_oep = true;
-                    g_unpack_base = base;
-                    g_unpack_size = size;
-                    this->log.error("[UNPACK] OEP=0x%llx (rva 0x%llx) -> dumping unpacked image\n",
-                                    static_cast<unsigned long long>(address),
-                                    static_cast<unsigned long long>(address - base));
-                    dump_mem("C:\\dumps\\unpacked.bin", base, size);
-                    if (FILE* fm = fopen("C:\\dumps\\unpacked.meta", "w"))
-                    {
-                        fprintf(fm, "base=0x%llx\nsize_of_image=0x%llx\nentry_rva=0x%llx\noep_rva=0x%llx\n",
-                                static_cast<unsigned long long>(base), static_cast<unsigned long long>(size),
-                                static_cast<unsigned long long>(entry_rva),
-                                static_cast<unsigned long long>(address - base));
-                        fclose(fm);
-                    }
-                    if (std::getenv("SOGEN_STOP_AT_OEP") != nullptr)
-                    {
-                        cpu.stop();
-                    }
-                });
+            this->emu().hook_memory_range_execution(oep_sec->region.start, oep_sec->region.length, oep_cb);
         });
 
         if (std::getenv("SOGEN_LATEDUMP_AT") != nullptr)

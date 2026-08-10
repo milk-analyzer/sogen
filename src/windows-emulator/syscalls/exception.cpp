@@ -51,6 +51,21 @@ namespace sogen
             auto record = exception_record.read();
             auto ctx = thread_context.read();
 
+            // ExceptionRecord is a guest-authored value, and save_exception_record dereferences it as
+            // a HOST pointer. Every other path into the dispatcher zeroes it; this is the only one
+            // that starts from a record the guest wrote, so it has to zero it here. Dropping the
+            // nested record costs nothing: nothing downstream walks the chain.
+            if (record.ExceptionRecord)
+            {
+                c.win_emu.log.warn("Dropping nested exception record 0x%" PRIx64 " from NtRaiseException\n",
+                                   static_cast<uint64_t>(record.ExceptionRecord));
+                record.ExceptionRecord = 0;
+            }
+            if (record.NumberParameters > EXCEPTION_MAXIMUM_PARAMETERS)
+            {
+                record.NumberParameters = EXCEPTION_MAXIMUM_PARAMETERS;
+            }
+
             if (handle_exception)
             {
                 // First-chance software exception (RtlRaiseException / C++ throw / VMProtect SEH-based

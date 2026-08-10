@@ -14,7 +14,7 @@ Branched from upstream **`e3a416b`**, five commits, **8 files, +406 / −10**.
 | commit | topic | why |
 |---|---|---|
 | 1 | `analyzer`: delay-load `whp-emulator.dll` | Without it `analyzer.exe` fails to start on a Windows 10 host that has no Hyper-V, before `main()` runs. |
-| 2 | `sleigh`: `SBB r64,imm32` sign-extension, `XCHG m32,r32` zero-extension | Two x86-64 decode defects in the SLEIGH data the icicle backend compiles at runtime. VMProtect's integrity arithmetic depends on the hardware behaviour, so the emulated result diverged. |
+| 2 | `sleigh`: `SBB r64/m64,imm32` sign-extension, `XCHG m32,r32` zero-extension | Two x86-64 decode defects in the SLEIGH data. **Affects the icicle backend only** — SLEIGH is not used by unicorn, which is what vmpunpack runs, so this matters for icicle users and for upstream, not for the unpack path here. |
 | 3 | `exceptions`: dispatch `NtRaiseException(FirstChance=TRUE)` | Upstream logs "not supported" and aborts. Protected binaries route real control flow through SEH/VEH, so the run ended at the first raise. |
 | 4 | `emulator`: `SOGEN_NODELAY`, `SOGEN_TSC_STRIDE` | Collapse anti-sandbox sleeps and rdtsc delay loops. |
 | 5 | `emulator`: `SOGEN_UNPACK` — stop at OEP and dump the image | The core: arm an execution hook on the target's original code section, and on first hit dump the fully unpacked image plus its metadata. |
@@ -35,7 +35,14 @@ exactly as upstream.
 | `SOGEN_LATEDUMP_AT` | additionally dump image and heap N basic blocks after the OEP |
 | `SOGEN_NODELAY` | satisfy `NtDelayExecution` immediately |
 | `SOGEN_TSC_STRIDE` | advance the emulated TSC by a fixed stride per `rdtsc`/`rdtscp` |
-| `SOGEN_TRAIL`, `SOGEN_PROFILE` | diagnostic only: basic-block ring buffer, register probes, block profile |
+| `SOGEN_TRAIL`, `SOGEN_PROFILE` | diagnostic only: basic-block ring buffer and block profile |
+
+> The `[DIAG]` scaffolding in `windows_emulator.cpp` — eight probe hooks, the access-violation register
+> dump, and the one-shot `sogen_image.bin` write — is **not** environment-gated and fires on every run.
+> The probe addresses are one sample's handler offsets and are meaningless on any other target. It is
+> left in because removing it means a rebuild and a re-pin downstream, not because anything depends on
+> it; vmpunpack reads none of it. Delete it at the next rebuild, and note that the AV block is the only
+> reader of the `SOGEN_TRAIL` ring buffer.
 
 ## Output contract
 
