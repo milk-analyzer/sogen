@@ -1308,6 +1308,12 @@ namespace sogen
 
                 // [DIAG] Dump full CPU context + instruction bytes for unmapped faults, to diagnose
                 // VMProtect pointer-computation divergences (e.g. dropped image base).
+                // Gated: protected samples drive control flow through exceptions, so access violations
+                // are routine, and this used to flood the log the wrapper shows the analyst on failure.
+                // SOGEN_TRAIL also enables it - this block is the only reader of the ring buffer.
+                static const bool g_diag = std::getenv("SOGEN_DIAG") != nullptr ||
+                                           std::getenv("SOGEN_TRAIL") != nullptr;
+                if (g_diag)
                 {
                     const auto d_rip = acting.reg<uint64_t>(x86_register::rip);
                     const auto* d_mod = this->mod_manager.find_by_address(d_rip);
@@ -1372,34 +1378,6 @@ namespace sogen
                                         static_cast<unsigned long long>(e.rcx), static_cast<unsigned long long>(e.rdx));
                     }
 
-                    // [DIAG] One-shot: dump the full s.exe image from emulated memory so the unpacked
-                    // payload (sections decrypted / imports resolved further than a static unpacker
-                    // reaches) can be extracted and rebuilt into a runnable PE offline.
-                    static bool g_image_dumped = false;
-                    if (!g_image_dumped)
-                    {
-                        g_image_dumped = true;
-                        const uint64_t img_base = 0x140000000ull;
-                        const uint64_t img_size = 0x1a9c000ull;
-                        if (FILE* fdump = fopen("C:\\dumps\\sogen_image.bin", "wb"))
-                        {
-                            uint8_t pg[0x1000];
-                            uint64_t good = 0;
-                            for (uint64_t off = 0; off < img_size; off += 0x1000)
-                            {
-                                memset(pg, 0, sizeof(pg));
-                                if (acting.try_read_memory(img_base + off, pg, sizeof(pg)))
-                                {
-                                    ++good;
-                                }
-                                fwrite(pg, 1, sizeof(pg), fdump);
-                            }
-                            fclose(fdump);
-                            this->log.error("[DIAG] dumped s.exe image: %llu/%llu pages readable -> C:\\dumps\\sogen_image.bin\n",
-                                            static_cast<unsigned long long>(good),
-                                            static_cast<unsigned long long>(img_size / 0x1000));
-                        }
-                    }
                 }
 
                 this->callbacks.on_memory_violate(address, size, operation, type);
@@ -1410,8 +1388,10 @@ namespace sogen
         });
 
         // [DIAG] Snapshot rcx/r10/rax each time execution reaches the probe addresses (last write wins,
-        // so the values reflect the faulting iteration).
-        for (size_t pi = 0; pi < 8; ++pi)
+        // so the values reflect the faulting iteration). The addresses are one sample's handler
+        // offsets and are meaningless elsewhere, so this costs a hook and a lock for nothing unless
+        // it was asked for.
+        for (size_t pi = 0; pi < 8 && std::getenv("SOGEN_DIAG") != nullptr; ++pi)
         {
             const size_t idx = pi;
             this->emu().hook_memory_execution(g_probe_addr[idx], [this, idx](cpu_interface& cpu, uint64_t) {

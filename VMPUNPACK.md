@@ -37,12 +37,10 @@ exactly as upstream.
 | `SOGEN_TSC_STRIDE` | advance the emulated TSC by a fixed stride per `rdtsc`/`rdtscp` |
 | `SOGEN_TRAIL`, `SOGEN_PROFILE` | diagnostic only: basic-block ring buffer and block profile |
 
-> The `[DIAG]` scaffolding in `windows_emulator.cpp` — eight probe hooks, the access-violation register
-> dump, and the one-shot `sogen_image.bin` write — is **not** environment-gated and fires on every run.
-> The probe addresses are one sample's handler offsets and are meaningless on any other target. It is
-> left in because removing it means a rebuild and a re-pin downstream, not because anything depends on
-> it; vmpunpack reads none of it. Delete it at the next rebuild, and note that the AV block is the only
-> reader of the `SOGEN_TRAIL` ring buffer.
+> `SOGEN_DIAG` gates the remaining `[DIAG]` scaffolding: the access-violation register/instruction dump
+> and eight probe hooks whose addresses are one sample's handler offsets. `SOGEN_TRAIL` implies it,
+> because the AV block is the only reader of the ring buffer. The one-shot `sogen_image.bin` write is
+> gone — it duplicated `unpacked.bin` from two hardcoded literals and nothing read it.
 
 ## Output contract
 
