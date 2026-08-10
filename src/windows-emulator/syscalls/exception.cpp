@@ -1,6 +1,7 @@
 #include "../std_include.hpp"
 #include "../emulator_utils.hpp"
 #include "../syscall_utils.hpp"
+#include "../exception_dispatch.hpp"
 
 namespace sogen
 {
@@ -44,16 +45,24 @@ namespace sogen
         }
 
         NTSTATUS handle_NtRaiseException(const syscall_context& c,
-                                         const emulator_object<EMU_EXCEPTION_RECORD<EmulatorTraits<Emu64>>> /*exception_record*/,
-                                         const emulator_object<CONTEXT64> /*thread_context*/, const BOOLEAN handle_exception)
+                                         const emulator_object<EMU_EXCEPTION_RECORD<EmulatorTraits<Emu64>>> exception_record,
+                                         const emulator_object<CONTEXT64> thread_context, const BOOLEAN handle_exception)
         {
+            auto record = exception_record.read();
+            auto ctx = thread_context.read();
+
             if (handle_exception)
             {
-                c.win_emu.log.error("Unhandled exceptions not supported yet!\n");
-                c.emu.stop();
-                return STATUS_NOT_SUPPORTED;
+                // First-chance software exception (RtlRaiseException / C++ throw / VMProtect SEH-based
+                // control flow). Dispatch it to the guest KiUserExceptionDispatcher with the captured
+                // raise-point record + context so SEH/VEH handlers run and execution can continue,
+                // instead of aborting the emulation.
+                c.write_status = false;
+                dispatch_raised_exception(c.win_emu, c.vcpu, record, ctx);
+                return STATUS_SUCCESS;
             }
 
+            // Second-chance / genuinely unhandled exception: nothing caught it -> fatal.
             c.win_emu.callbacks.on_exception();
             c.emu.stop();
 

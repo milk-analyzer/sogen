@@ -302,6 +302,28 @@ namespace sogen
         dispatch_exception_pointers(vcpu.cpu, win_emu.process.ki_user_exception_dispatcher, pointers);
     }
 
+    void dispatch_raised_exception(windows_emulator& win_emu, vcpu_context& vcpu,
+                                   EMU_EXCEPTION_RECORD<EmulatorTraits<Emu64>>& record, CONTEXT64& ctx)
+    {
+        // Dispatch a software-raised exception (NtRaiseException / RtlRaiseException) to the guest's
+        // KiUserExceptionDispatcher using the raise-point record + context the caller captured, so
+        // SEH/VEH handlers run and can continue execution.
+        win_emu.record_exception_trace({
+            .status = static_cast<uint32_t>(record.ExceptionCode),
+            .tid = vcpu.thread().id,
+            .vcpu = static_cast<uint32_t>(vcpu.cpu.index()),
+            .rip = static_cast<uint64_t>(ctx.Rip),
+            .info = record.NumberParameters > 1 ? static_cast<uint64_t>(record.ExceptionInformation[1]) : 0,
+        });
+
+        sync_wow64_cpu_reserved_context(win_emu, vcpu.cpu, vcpu.thread(), ctx);
+
+        EMU_EXCEPTION_POINTERS<EmulatorTraits<Emu64>> pointers{};
+        pointers.ContextRecord = reinterpret_cast<EmulatorTraits<Emu64>::PVOID>(&ctx);
+        pointers.ExceptionRecord = reinterpret_cast<EmulatorTraits<Emu64>::PVOID>(&record);
+        dispatch_exception_pointers(vcpu.cpu, win_emu.process.ki_user_exception_dispatcher, pointers);
+    }
+
     void dispatch_access_violation(windows_emulator& win_emu, vcpu_context& vcpu, const uint64_t address, const memory_operation operation)
     {
         dispatch_exception(win_emu, vcpu, STATUS_ACCESS_VIOLATION,
