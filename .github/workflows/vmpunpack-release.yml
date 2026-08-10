@@ -45,21 +45,62 @@ jobs:
         shell: pwsh
         run: Get-ChildItem -Recurse build/release/artifacts | Select-Object Length, FullName
 
+      # build/release/artifacts holds ~1 GB of .lib, .pdb, fuzzers and test binaries.
+      # vmpunpack needs 4 built binaries, the MSVC runtime and the SLEIGH data - nothing else.
       - name: Package for vmpunpack
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $out = "pkg"
           New-Item -ItemType Directory -Force $out | Out-Null
-          Copy-Item -Recurse -Force build/release/artifacts/* $out
-          # The SLEIGH data from commit 2 is compiled by icicle at load time; ship it
-          # alongside the binaries whether or not the build already staged it.
-          $sleigh = "src/backends/icicle-emulator/icicle-bridge/data/Ghidra"
-          if (Test-Path $sleigh) {
-            New-Item -ItemType Directory -Force "$out/Ghidra" | Out-Null
-            Copy-Item -Recurse -Force "$sleigh/*" "$out/Ghidra"
+
+          $built = @("analyzer.exe", "icicle-emulator.dll", "unicorn-emulator.dll", "whp-emulator.dll")
+          foreach ($f in $built) {
+            $src = "build/release/artifacts/$f"
+            if (-not (Test-Path $src)) { throw "build did not produce $f" }
+            Copy-Item -Force $src $out
           }
-          if (-not (Test-Path "$out/analyzer.exe")) { throw "analyzer.exe missing from the build output" }
+
+          # Not build output: these come from the VC redistributable on the runner, which is the
+          # same toolset that produced analyzer.exe, so the versions match by construction.
+          $runtime = @("msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll", "msvcp140_atomic_wait.dll",
+                       "msvcp140_codecvt_ids.dll", "vcruntime140.dll", "vcruntime140_1.dll",
+                       "vcruntime140_threads.dll", "concrt140.dll", "vccorlib140.dll")
+          $redist = $env:VCToolsRedistDir
+          $crt = $null
+          if ($redist) { $crt = Get-ChildItem -Path $redist -Recurse -Directory -Filter "Microsoft.VC*.CRT" -ErrorAction SilentlyContinue |
+                                Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1 }
+          if (-not $crt) {
+            $crt = Get-ChildItem "C:/Program Files/Microsoft Visual Studio/2022/*/VC/Redist/MSVC" -Recurse -Directory `
+                     -Filter "Microsoft.VC*.CRT" -ErrorAction SilentlyContinue |
+                   Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
+          }
+          if (-not $crt) { throw "could not locate the x64 VC redistributable CRT directory" }
+          Write-Host "VC redist: $($crt.FullName)"
+          foreach ($f in $runtime) {
+            $src = Join-Path $crt.FullName $f
+            if (-not (Test-Path $src)) { throw "VC redist is missing $f" }
+            Copy-Item -Force $src $out
+          }
+
+          # SLEIGH data from commit 2, compiled by icicle at load time.
+          $sleigh = if (Test-Path "build/release/artifacts/Ghidra") { "build/release/artifacts/Ghidra" }
+                    else { "src/backends/icicle-emulator/icicle-bridge/data/Ghidra" }
+          if (-not (Test-Path $sleigh)) { throw "SLEIGH data not found" }
+          New-Item -ItemType Directory -Force "$out/Ghidra" | Out-Null
+          Copy-Item -Recurse -Force "$sleigh/*" "$out/Ghidra"
+
+          $top = (Get-ChildItem -File $out).Count
+          $sinc = (Get-ChildItem -Recurse -File "$out/Ghidra").Count
+          Write-Host "packaged: $top top-level files, $sinc SLEIGH files"
+          if ($top -ne ($built.Count + $runtime.Count)) { throw "expected $($built.Count + $runtime.Count) top-level files, got $top" }
+          if ($sinc -lt 40) { throw "SLEIGH data looks incomplete ($sinc files)" }
+          Get-ChildItem -Recurse -File $out | ForEach-Object {
+            "{0,10:n0}  {1}" -f $_.Length, $_.FullName.Substring((Resolve-Path $out).Path.Length + 1)
+          }
+
           Compress-Archive -Path "$out/*" -DestinationPath sogen-vmpunpack-win-x64.zip -Force
+          "{0:n1} MB" -f ((Get-Item sogen-vmpunpack-win-x64.zip).Length / 1MB)
           Get-FileHash sogen-vmpunpack-win-x64.zip -Algorithm SHA256 | Format-List
 
       # Proves the patch actually made it into this binary, rather than silently
