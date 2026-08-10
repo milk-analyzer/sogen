@@ -1,0 +1,92 @@
+name: vmpunpack release build
+
+# Builds the patched analyzer.exe that vmpunpack drives, and packages it the way
+# vmpunpack's setup.cmd expects. Windows x64 release only - the other platforms
+# and configurations upstream builds are not relevant to this branch.
+
+on:
+  push:
+    branches: [vmpunpack]
+    paths-ignore: ["**.md"]
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Windows x64 release
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Enable Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # The root CMakeLists runs the Steam-bridge generator at configure time.
+      - name: Install libclang
+        run: python -m pip install --disable-pip-version-check libclang
+
+      - name: Build
+        run: cmake --preset=release && cmake --build --preset=release
+
+      - name: List build artifacts
+        shell: pwsh
+        run: Get-ChildItem -Recurse build/release/artifacts | Select-Object Length, FullName
+
+      - name: Package for vmpunpack
+        shell: pwsh
+        run: |
+          $out = "pkg"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item -Recurse -Force build/release/artifacts/* $out
+          # The SLEIGH data from commit 2 is compiled by icicle at load time; ship it
+          # alongside the binaries whether or not the build already staged it.
+          $sleigh = "src/backends/icicle-emulator/icicle-bridge/data/Ghidra"
+          if (Test-Path $sleigh) {
+            New-Item -ItemType Directory -Force "$out/Ghidra" | Out-Null
+            Copy-Item -Recurse -Force "$sleigh/*" "$out/Ghidra"
+          }
+          if (-not (Test-Path "$out/analyzer.exe")) { throw "analyzer.exe missing from the build output" }
+          Compress-Archive -Path "$out/*" -DestinationPath sogen-vmpunpack-win-x64.zip -Force
+          Get-FileHash sogen-vmpunpack-win-x64.zip -Algorithm SHA256 | Format-List
+
+      # Proves the patch actually made it into this binary, rather than silently
+      # building stock upstream.
+      - name: Verify the patch is present in the built analyzer
+        shell: pwsh
+        run: |
+          $bytes = [IO.File]::ReadAllBytes("pkg/analyzer.exe")
+          $text  = [Text.Encoding]::ASCII.GetString($bytes)
+          $want  = @("SOGEN_UNPACK", "SOGEN_STOP_AT_OEP", "SOGEN_OEP_RVA", "SOGEN_LATEDUMP_AT",
+                     "SOGEN_NODELAY", "SOGEN_TSC_STRIDE",
+                     "C:\dumps\unpacked.bin", "C:\dumps\unpacked.meta", "[UNPACK] OEP=")
+          $missing = @($want | Where-Object { -not $text.Contains($_) })
+          foreach ($w in $want) {
+            "{0,-28} {1}" -f $w, $(if ($text.Contains($w)) { "present" } else { "MISSING" })
+          }
+          if ($missing.Count) { throw "built analyzer.exe is missing: $($missing -join ', ')" }
+          "all patch markers present"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sogen-vmpunpack-win-x64
+          path: sogen-vmpunpack-win-x64.zip
+          retention-days: 30
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload ${{ github.event.release.tag_name }} sogen-vmpunpack-win-x64.zip --clobber

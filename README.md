@@ -1,3 +1,16 @@
+> ## ⚠️ This is a modified fork
+>
+> Branch **`vmpunpack`** carries changes **not** present in [upstream sogen](https://github.com/momo5502/sogen):
+> five commits on top of `e3a416b`, 8 files, +406 / −10, adding an unpack / OEP-dump mode plus two
+> x86-64 decode fixes and a software-exception path.
+>
+> It exists so the patched `analyzer.exe` used by
+> [vmpunpack](https://github.com/milk-analyzer/vmpunpack) is distributed together with its
+> corresponding source, as GPL-2.0 requires. **See [VMPUNPACK.md](VMPUNPACK.md).**
+>
+> Everything is off by default — without `SOGEN_UNPACK` set, this behaves exactly as upstream.
+> For anything that is not vmpunpack-specific, go upstream; issues here are not upstream's problem.
+
 <h1 align="center">
 	<a href="https://github.com/momo5502/sogen"><img src="https://momo5502.com/sogen/banner.png" height="300" /></a>
 	<br>
