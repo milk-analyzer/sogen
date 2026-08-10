@@ -9,11 +9,13 @@ on:
     branches: [vmpunpack]
     paths-ignore: ["**.md"]
   workflow_dispatch:
-  release:
-    types: [published]
+
+# Release assets are uploaded by hand from a run that has been verified against a
+# known-good bundle, so publishing a release deliberately does NOT rebuild and
+# overwrite them.
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -125,9 +127,3 @@ jobs:
           name: sogen-vmpunpack-win-x64
           path: sogen-vmpunpack-win-x64.zip
           retention-days: 30
-
-      - name: Attach to release
-        if: github.event_name == 'release'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload ${{ github.event.release.tag_name }} sogen-vmpunpack-win-x64.zip --clobber
