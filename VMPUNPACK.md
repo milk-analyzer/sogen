@@ -9,7 +9,8 @@ source**, as GPL-2.0 §3 requires. Everything here is GPL-2.0, same as upstream.
 
 ## What is changed
 
-Branched from upstream **`e3a416b`**, five commits, **8 files, +406 / −10**.
+Branched from upstream **`e3a416b`**. The five commits below carry the feature; later commits fix
+defects found reviewing them and add the release build.
 
 | commit | topic | why |
 |---|---|---|
@@ -51,7 +52,10 @@ With `SOGEN_UNPACK=1`, on reaching the OEP:
 | `C:\dumps\unpacked.bin` | the image, `[base, base + SizeOfImage)` |
 | `C:\dumps\unpacked.meta` | `base=0x…`, `size_of_image=0x…`, `entry_rva=0x…`, `oep_rva=0x…` |
 | `C:\dumps\unpacked_late.bin`, `C:\dumps\heap.bin` | with `SOGEN_LATEDUMP_AT` |
-| `C:\dumps\sogen_image.bin` | diagnostic one-shot dump on an unmapped fault |
+
+If the image cannot be written in full, the partial file is removed and **`unpacked.meta` is
+deliberately not written**. An integrator seeing a missing meta after an OEP hit should read that as a
+failed dump, not a crash; the reason is on stdout.
 
 ## Building
 

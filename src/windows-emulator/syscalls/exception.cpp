@@ -61,9 +61,11 @@ namespace sogen
                                    static_cast<uint64_t>(record.ExceptionRecord));
                 record.ExceptionRecord = 0;
             }
-            if (record.NumberParameters > EXCEPTION_MAXIMUM_PARAMETERS)
+            // std::size of the array being protected, not the host SDK's macro: this file also builds
+            // on Linux, macOS, Android and Emscripten, where EXCEPTION_MAXIMUM_PARAMETERS does not exist.
+            if (record.NumberParameters > std::size(record.ExceptionInformation))
             {
-                record.NumberParameters = EXCEPTION_MAXIMUM_PARAMETERS;
+                record.NumberParameters = static_cast<uint32_t>(std::size(record.ExceptionInformation));
             }
 
             if (handle_exception)
