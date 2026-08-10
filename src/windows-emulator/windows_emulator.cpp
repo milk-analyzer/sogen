@@ -1059,6 +1059,32 @@ namespace sogen
 
     void windows_emulator::setup_hooks()
     {
+        // [DIAG] Probe points inside the VMProtect handler that faults, to see rcx/r10 around the
+        // 32-bit ops (shr r10d / mov ecx,r10d / sub / sbb) and pinpoint the zero-extension divergence.
+        static constexpr uint64_t g_probe_addr[8] = {
+            0x140d9c018, 0x140d9c01c, 0x140d9c022, 0x140d9c025,
+            0x140d9c028, 0x140d9c04e, 0x140d9c09b, 0x140d9c0bc};
+        static uint64_t g_probe_rcx[8] = {0};
+        static uint64_t g_probe_r10[8] = {0};
+        static uint64_t g_probe_rax[8] = {0};
+        static uint64_t g_probe_hits[8] = {0};
+
+        // [DIAG] Control-flow + VM-register ring buffer across s.exe basic blocks, so a register that a
+        // handler corrupts (and that only faults several handlers later) can be traced to its origin.
+        struct diag_bb
+        {
+            uint64_t addr, r8, r9, r10, r11, rcx, rdx;
+            uint32_t tid;
+        };
+        static constexpr size_t DIAG_RING = 128;
+        static diag_bb g_ring[DIAG_RING] = {};
+        static size_t g_ring_pos = 0;
+
+        // [UNPACK] Generic packer-unpacker state (filled from the target PE at OEP; no hard-coded addresses).
+        static uint64_t g_unpack_base = 0;
+        static uint64_t g_unpack_size = 0;
+        static bool g_unpack_oep = false;
+
         this->callbacks.on_module_load.add([this](mapped_module& mod) {
             for (size_t i = 0; i < mod.sections.size(); ++i)
             {
@@ -1227,6 +1253,27 @@ namespace sogen
             }
 
             auto region = this->memory.get_region_info(address);
+
+            // [UNPACK] VMProtect self-modification: a protection fault writing to a read-only page inside
+            // the main image (the VM decrypting its own .R}q handlers / later the original .text before
+            // the OEP jump). Trace above confirmed the write pointer is a legit walking pointer, so grant
+            // write and retry to let the unpack proceed. (Unmapped faults are NOT handled here -> divergence.)
+            if (type == memory_violation_type::protection && address >= 0x140000000ull &&
+                address < 0x141a9c000ull && region.is_committed && !region.permissions.is_guarded())
+            {
+                static uint64_t s_grants = 0;
+                const uint64_t page = address & ~static_cast<uint64_t>(0xFFF);
+                this->memory.protect_memory(page, 0x1000, region.permissions | memory_permission::write);
+                if (s_grants < 4)
+                {
+                    this->log.error("[UNPACK] granted write @0x%llx (rip 0x%llx)\n",
+                                    static_cast<unsigned long long>(address),
+                                    static_cast<unsigned long long>(acting.reg<uint64_t>(x86_register::rip)));
+                }
+                ++s_grants;
+                return memory_violation_continuation::restart;
+            }
+
             if (region.permissions.is_guarded())
             {
                 // Unset the GUARD_PAGE flag and dispatch a STATUS_GUARD_PAGE_VIOLATION
@@ -1251,12 +1298,305 @@ namespace sogen
                     }
                 }
 
+                // [DIAG] Dump full CPU context + instruction bytes for unmapped faults, to diagnose
+                // VMProtect pointer-computation divergences (e.g. dropped image base).
+                {
+                    const auto d_rip = acting.reg<uint64_t>(x86_register::rip);
+                    const auto* d_mod = this->mod_manager.find_by_address(d_rip);
+                    this->log.error("[DIAG] AV addr=0x%llx op=%d type=%d rip=0x%llx (%s+0x%llx)\n",
+                                    static_cast<unsigned long long>(address), static_cast<int>(operation),
+                                    static_cast<int>(type), static_cast<unsigned long long>(d_rip),
+                                    d_mod ? d_mod->name.c_str() : "?",
+                                    d_mod ? static_cast<unsigned long long>(d_rip - d_mod->image_base) : 0ull);
+                    const x86_register d_gpr[16] = {
+                        x86_register::rax, x86_register::rbx, x86_register::rcx, x86_register::rdx,
+                        x86_register::rsi, x86_register::rdi, x86_register::rbp, x86_register::rsp,
+                        x86_register::r8,  x86_register::r9,  x86_register::r10, x86_register::r11,
+                        x86_register::r12, x86_register::r13, x86_register::r14, x86_register::r15};
+                    static const char* const d_nm[16] = {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+                                                         "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"};
+                    for (int i = 0; i < 16; i += 4)
+                    {
+                        this->log.error("[DIAG] %s=%016llx %s=%016llx %s=%016llx %s=%016llx\n",
+                                        d_nm[i],   static_cast<unsigned long long>(acting.reg<uint64_t>(d_gpr[i])),
+                                        d_nm[i+1], static_cast<unsigned long long>(acting.reg<uint64_t>(d_gpr[i+1])),
+                                        d_nm[i+2], static_cast<unsigned long long>(acting.reg<uint64_t>(d_gpr[i+2])),
+                                        d_nm[i+3], static_cast<unsigned long long>(acting.reg<uint64_t>(d_gpr[i+3])));
+                    }
+                    // Dump a window of code bytes [rip-0xC0 .. rip+0x10) so the instruction that last
+                    // wrote the divergent register can be disassembled offline.
+                    const uint64_t d_wlo = d_rip - 0xC0;
+                    uint8_t d_win[0xD0] = {0};
+                    if (acting.try_read_memory(d_wlo, d_win, sizeof(d_win)))
+                    {
+                        for (size_t off = 0; off < sizeof(d_win); off += 16)
+                        {
+                            char line[64];
+                            int p = 0;
+                            for (size_t j = 0; j < 16; ++j)
+                                p += snprintf(line + p, sizeof(line) - p, "%02x", d_win[off + j]);
+                            this->log.error("[DIAG] code 0x%llx: %s\n",
+                                            static_cast<unsigned long long>(d_wlo + off), line);
+                        }
+                    }
+                    for (size_t pi = 0; pi < 8; ++pi)
+                    {
+                        this->log.error("[DIAG] probe@0x%llx hits=%llu rcx=%016llx r10=%016llx rax=%016llx\n",
+                                        static_cast<unsigned long long>(g_probe_addr[pi]),
+                                        static_cast<unsigned long long>(g_probe_hits[pi]),
+                                        static_cast<unsigned long long>(g_probe_rcx[pi]),
+                                        static_cast<unsigned long long>(g_probe_r10[pi]),
+                                        static_cast<unsigned long long>(g_probe_rax[pi]));
+                    }
+
+                    // [DIAG] Dump the basic-block / VM-register trail (oldest -> newest) leading to the fault.
+                    for (size_t k = 0; k < DIAG_RING; ++k)
+                    {
+                        const diag_bb& e = g_ring[(g_ring_pos + k) % DIAG_RING];
+                        if (e.addr == 0)
+                        {
+                            continue;
+                        }
+                        this->log.error("[TRAIL] t%u %llx r8=%llx r9=%llx r10=%llx r11=%llx rcx=%llx rdx=%llx\n",
+                                        e.tid, static_cast<unsigned long long>(e.addr),
+                                        static_cast<unsigned long long>(e.r8), static_cast<unsigned long long>(e.r9),
+                                        static_cast<unsigned long long>(e.r10), static_cast<unsigned long long>(e.r11),
+                                        static_cast<unsigned long long>(e.rcx), static_cast<unsigned long long>(e.rdx));
+                    }
+
+                    // [DIAG] One-shot: dump the full s.exe image from emulated memory so the unpacked
+                    // payload (sections decrypted / imports resolved further than a static unpacker
+                    // reaches) can be extracted and rebuilt into a runnable PE offline.
+                    static bool g_image_dumped = false;
+                    if (!g_image_dumped)
+                    {
+                        g_image_dumped = true;
+                        const uint64_t img_base = 0x140000000ull;
+                        const uint64_t img_size = 0x1a9c000ull;
+                        if (FILE* fdump = fopen("C:\\dumps\\sogen_image.bin", "wb"))
+                        {
+                            uint8_t pg[0x1000];
+                            uint64_t good = 0;
+                            for (uint64_t off = 0; off < img_size; off += 0x1000)
+                            {
+                                memset(pg, 0, sizeof(pg));
+                                if (acting.try_read_memory(img_base + off, pg, sizeof(pg)))
+                                {
+                                    ++good;
+                                }
+                                fwrite(pg, 1, sizeof(pg), fdump);
+                            }
+                            fclose(fdump);
+                            this->log.error("[DIAG] dumped s.exe image: %llu/%llu pages readable -> C:\\dumps\\sogen_image.bin\n",
+                                            static_cast<unsigned long long>(good),
+                                            static_cast<unsigned long long>(img_size / 0x1000));
+                        }
+                    }
+                }
+
                 this->callbacks.on_memory_violate(address, size, operation, type);
                 dispatch_access_violation(*this, vcpu, address, operation);
             }
 
             return memory_violation_continuation::resume;
         });
+
+        // [DIAG] Snapshot rcx/r10/rax each time execution reaches the probe addresses (last write wins,
+        // so the values reflect the faulting iteration).
+        for (size_t pi = 0; pi < 8; ++pi)
+        {
+            const size_t idx = pi;
+            this->emu().hook_memory_execution(g_probe_addr[idx], [this, idx](cpu_interface& cpu, uint64_t) {
+                const std::scoped_lock lock(this->kernel_lock_);
+                auto& acting = this->vcpu(cpu.index()).cpu;
+                g_probe_rcx[idx] = acting.reg<uint64_t>(x86_register::rcx);
+                g_probe_r10[idx] = acting.reg<uint64_t>(x86_register::r10);
+                g_probe_rax[idx] = acting.reg<uint64_t>(x86_register::rax);
+                ++g_probe_hits[idx];
+            });
+        }
+
+        if (std::getenv("SOGEN_TRAIL") != nullptr)
+        this->emu().hook_basic_block([this](cpu_interface& cpu, const basic_block& block) {
+            if (block.address < 0x140000000ull || block.address >= 0x141a9c000ull)
+            {
+                return;
+            }
+            auto& acting = this->vcpu(cpu.index()).cpu;
+            diag_bb& e = g_ring[g_ring_pos % DIAG_RING];
+            e.addr = block.address;
+            e.r8 = acting.reg<uint64_t>(x86_register::r8);
+            e.r9 = acting.reg<uint64_t>(x86_register::r9);
+            e.r10 = acting.reg<uint64_t>(x86_register::r10);
+            e.r11 = acting.reg<uint64_t>(x86_register::r11);
+            e.rcx = acting.reg<uint64_t>(x86_register::rcx);
+            e.rdx = acting.reg<uint64_t>(x86_register::rdx);
+            e.tid = static_cast<uint32_t>(cpu.index());
+            ++g_ring_pos;
+        });
+
+        if (std::getenv("SOGEN_PROFILE") != nullptr)
+            this->emu().hook_basic_block([this](cpu_interface& cpu, const basic_block& block) {
+                (void)cpu;
+                if (block.address < 0x140000000ull || block.address >= 0x141a9c000ull)
+                {
+                    return;
+                }
+                static std::unordered_map<uint64_t, uint64_t> hits;
+                static uint64_t total = 0;
+                ++hits[block.address];
+                if (hits.size() > 300000)
+                {
+                    hits.clear();
+                }
+                if (++total % 10000000ull == 0)
+                {
+                    std::vector<std::pair<uint64_t, uint64_t>> v(hits.begin(), hits.end());
+                    const size_t topn = std::min<size_t>(15, v.size());
+                    std::partial_sort(v.begin(), v.begin() + topn, v.end(),
+                                      [](const auto& a, const auto& b) { return a.second > b.second; });
+                    this->log.error("[PROFILE] blocks=%lluM distinct=%zu top:\n",
+                                    static_cast<unsigned long long>(total / 1000000ull), hits.size());
+                    for (size_t i = 0; i < topn; ++i)
+                    {
+                        this->log.error("[PROFILE]   0x%llx x%llu\n", static_cast<unsigned long long>(v[i].first),
+                                        static_cast<unsigned long long>(v[i].second));
+                    }
+                    hits.clear();
+                }
+            });
+
+        // [UNPACK] Generic packer/VMProtect unpacker. When the target's ORIGINAL code first executes (a
+        // section below the packer entry point) the sections are decrypted and imports are resolved -> dump
+        // the whole image as the unpacked sample. All addresses come from the TARGET PE (mod_manager.executable),
+        // so this works on any VMP-packed x64 binary, not just one sample.
+        //   SOGEN_UNPACK=1        enable
+        //   SOGEN_STOP_AT_OEP=1   freeze at OEP (clean unpacked snapshot) instead of running the payload
+        //   SOGEN_OEP_RVA=0x..    force the OEP RVA (override the heuristic)
+        //   SOGEN_LATEDUMP_AT=N   also dump image+heap after N post-OEP basic blocks (runtime-decrypted config)
+        const auto dump_mem = [this](const char* path, uint64_t lo, uint64_t sz) {
+            if (FILE* fo = fopen(path, "wb"))
+            {
+                uint8_t pg[0x1000];
+                uint64_t good = 0;
+                for (uint64_t off = 0; off < sz; off += 0x1000)
+                {
+                    memset(pg, 0, sizeof(pg));
+                    if (this->memory.try_read_memory(lo + off, pg, sizeof(pg)))
+                    {
+                        ++good;
+                    }
+                    fwrite(pg, 1, sizeof(pg), fo);
+                }
+                fclose(fo);
+                this->log.error("[UNPACK] dumped %s : %llu/%llu pages [0x%llx +0x%llx]\n", path,
+                                static_cast<unsigned long long>(good), static_cast<unsigned long long>(sz / 0x1000),
+                                static_cast<unsigned long long>(lo), static_cast<unsigned long long>(sz));
+            }
+        };
+
+        // Arm address (memory-range) execution hooks on the target's ORIGINAL code sections when it loads.
+        // Address hooks fire independently of instruction-precision (works with --no-inst-precision / JIT),
+        // unlike the on_section_first_execution callback which only fires on the per-instruction path.
+        this->callbacks.on_module_load.add([this, dump_mem](mapped_module& mod) {
+            static bool s_armed = false;
+            if (std::getenv("SOGEN_UNPACK") == nullptr || s_armed)
+            {
+                return;
+            }
+            // Identify the target exe: mod_manager.executable may not be assigned yet when its module-load
+            // callback fires, so also accept a module whose name ends in ".exe".
+            const bool by_ptr = (this->mod_manager.executable == &mod);
+            const bool by_name = mod.name.size() >= 4 && (mod.name.compare(mod.name.size() - 4, 4, ".exe") == 0 ||
+                                                          mod.name.compare(mod.name.size() - 4, 4, ".EXE") == 0);
+            if (!by_ptr && !by_name)
+            {
+                return;
+            }
+            s_armed = true;
+            const uint64_t base = mod.image_base;
+            const uint64_t size = mod.size_of_image;
+            const uint64_t entry_rva = mod.entry_point - base;
+            const char* forced = std::getenv("SOGEN_OEP_RVA");
+            const uint64_t frva = forced ? std::strtoull(forced, nullptr, 0) : 0;
+            this->log.error("[UNPACK] target=%s base=0x%llx size=0x%llx entry_rva=0x%llx -> arming OEP hooks\n",
+                            mod.name.c_str(), static_cast<unsigned long long>(base),
+                            static_cast<unsigned long long>(size), static_cast<unsigned long long>(entry_rva));
+            // Select the OEP section: the lowest-RVA executable section that does NOT contain the packer
+            // entry point (VMProtect's stub lives in the entry section; the real OEP is in an original code
+            // section). SOGEN_OEP_RVA overrides with the section covering that RVA.
+            const mapped_section* oep_sec = nullptr;
+            for (const auto& section : mod.sections)
+            {
+                const uint64_t sec_rva = section.region.start - base;
+                const bool exec = is_executable(section.region.permissions);
+                const bool has_entry = (sec_rva <= entry_rva && entry_rva < sec_rva + section.region.length);
+                this->log.error("[UNPACK]   sec %-14s rva=0x%llx len=0x%llx exec=%d entry=%d\n",
+                                section.name.c_str(), static_cast<unsigned long long>(sec_rva),
+                                static_cast<unsigned long long>(section.region.length), exec ? 1 : 0,
+                                has_entry ? 1 : 0);
+                const bool cand = forced ? (sec_rva <= frva && frva < sec_rva + section.region.length)
+                                         : (exec && !has_entry && section.region.length > 0);
+                if (cand && (oep_sec == nullptr || section.region.start < oep_sec->region.start))
+                {
+                    oep_sec = &section;
+                }
+            }
+            if (oep_sec == nullptr)
+            {
+                this->log.error("[UNPACK] no OEP section found -> set SOGEN_OEP_RVA to the real code RVA\n");
+                return;
+            }
+            this->log.error("[UNPACK] arming OEP section %s rva=0x%llx len=0x%llx\n", oep_sec->name.c_str(),
+                            static_cast<unsigned long long>(oep_sec->region.start - base),
+                            static_cast<unsigned long long>(oep_sec->region.length));
+            this->emu().hook_memory_range_execution(
+                oep_sec->region.start, oep_sec->region.length,
+                [this, dump_mem, base, size, entry_rva](cpu_interface& cpu, uint64_t address) {
+                    const std::scoped_lock lock(this->kernel_lock_);
+                    if (g_unpack_oep)
+                    {
+                        return;
+                    }
+                    g_unpack_oep = true;
+                    g_unpack_base = base;
+                    g_unpack_size = size;
+                    this->log.error("[UNPACK] OEP=0x%llx (rva 0x%llx) -> dumping unpacked image\n",
+                                    static_cast<unsigned long long>(address),
+                                    static_cast<unsigned long long>(address - base));
+                    dump_mem("C:\\dumps\\unpacked.bin", base, size);
+                    if (FILE* fm = fopen("C:\\dumps\\unpacked.meta", "w"))
+                    {
+                        fprintf(fm, "base=0x%llx\nsize_of_image=0x%llx\nentry_rva=0x%llx\noep_rva=0x%llx\n",
+                                static_cast<unsigned long long>(base), static_cast<unsigned long long>(size),
+                                static_cast<unsigned long long>(entry_rva),
+                                static_cast<unsigned long long>(address - base));
+                        fclose(fm);
+                    }
+                    if (std::getenv("SOGEN_STOP_AT_OEP") != nullptr)
+                    {
+                        cpu.stop();
+                    }
+                });
+        });
+
+        if (std::getenv("SOGEN_LATEDUMP_AT") != nullptr)
+            this->emu().hook_basic_block([this, dump_mem](cpu_interface& cpu, const basic_block& block) {
+                (void)cpu;
+                if (!g_unpack_oep || block.address < g_unpack_base || block.address >= g_unpack_base + g_unpack_size)
+                {
+                    return;
+                }
+                static uint64_t n = 0;
+                static const uint64_t at = std::strtoull(std::getenv("SOGEN_LATEDUMP_AT"), nullptr, 0);
+                if (++n != at)
+                {
+                    return;
+                }
+                this->log.error("[UNPACK] late snapshot after %llu post-OEP blocks\n", static_cast<unsigned long long>(at));
+                dump_mem("C:\\dumps\\unpacked_late.bin", g_unpack_base, g_unpack_size);
+                dump_mem("C:\\dumps\\heap.bin", 0x100000000ull, 0x6000000ull);
+            });
 
         if (this->uses_instruction_precision())
         {
