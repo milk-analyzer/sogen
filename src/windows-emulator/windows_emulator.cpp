@@ -1088,6 +1088,17 @@ namespace sogen
             return instruction_hook_continuation::skip_instruction;
         });
 
+        // [UNPACK] VMProtect uses rdtsc as an anti-sandbox DELAY: t1=rdtsc; spin; t2=rdtsc; loop until
+        // (t2-t1) reaches a target. With the instruction-tick clock (1 tick/instr) that target takes
+        // hundreds of millions of iterations. Advance the returned TSC by a large stride per rdtsc call
+        // (like real HW, where each rdtsc reads a fresh cycle count) so the delay loop exits quickly while
+        // a small measured block still shows a plausible delta. Opt-in via SOGEN_TSC_STRIDE (default off).
+        static uint64_t g_tsc_acc = 0;
+        static const uint64_t g_tsc_stride = [] {
+            const char* s = std::getenv("SOGEN_TSC_STRIDE");
+            return s ? std::strtoull(s, nullptr, 0) : 0ull;
+        }();
+
         this->emu().hook_instruction(x86_hookable_instructions::rdtscp, [&](cpu_interface& cpu, uint64_t) {
             const std::scoped_lock lock(this->kernel_lock_);
             auto& vcpu = this->vcpu(cpu.index());
@@ -1095,7 +1106,8 @@ namespace sogen
             auto& acting = vcpu.cpu;
             this->callbacks.on_rdtscp();
 
-            const auto ticks = this->clock_->timestamp_counter();
+            g_tsc_acc += g_tsc_stride;
+            const auto ticks = this->clock_->timestamp_counter() + g_tsc_acc;
             acting.reg(x86_register::rax, static_cast<uint32_t>(ticks));
             acting.reg(x86_register::rdx, static_cast<uint32_t>(ticks >> 32));
 
@@ -1113,7 +1125,8 @@ namespace sogen
             auto& acting = vcpu.cpu;
             this->callbacks.on_rdtsc();
 
-            const auto ticks = this->clock_->timestamp_counter();
+            g_tsc_acc += g_tsc_stride;
+            const auto ticks = this->clock_->timestamp_counter() + g_tsc_acc;
             acting.reg(x86_register::rax, static_cast<uint32_t>(ticks));
             acting.reg(x86_register::rdx, static_cast<uint32_t>(ticks >> 32));
 

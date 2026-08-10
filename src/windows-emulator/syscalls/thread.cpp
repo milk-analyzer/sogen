@@ -562,7 +562,8 @@ namespace sogen
                                          const emulator_object<LARGE_INTEGER> delay_interval)
         {
             auto& t = c.thread();
-            if (delay_interval.value())
+            // Optionally collapse anti-sandbox sleeps so the payload fast-forwards to its C2 beacon.
+            if (delay_interval.value() && std::getenv("SOGEN_NODELAY") == nullptr)
             {
                 t.await_time = utils::convert_delay_interval_to_time_point(c.win_emu.clock(), delay_interval.read());
             }
