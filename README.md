@@ -1,14 +1,16 @@
 > ## ⚠️ This is a modified fork
 >
-> Branch **`vmpunpack`** carries changes **not** present in [upstream sogen](https://github.com/momo5502/sogen):
-> five commits on top of `e3a416b`, 8 files, +406 / −10, adding an unpack / OEP-dump mode plus two
-> x86-64 decode fixes and a software-exception path.
+> Branch **`vmpunpack`** carries changes **not** present in [upstream sogen](https://github.com/momo5502/sogen),
+> on top of `e3a416b`: an unpack / OEP-dump mode, two x86-64 decode fixes, a software-exception path, and
+> host containment. `git diff e3a416b vmpunpack` shows all of it.
 >
 > It exists so the patched `analyzer.exe` used by
 > [vmpunpack](https://github.com/milk-analyzer/vmpunpack) is distributed together with its
 > corresponding source, as GPL-2.0 requires. **See [VMPUNPACK.md](VMPUNPACK.md).**
 >
-> Everything is off by default — without `SOGEN_UNPACK` set, this behaves exactly as upstream.
+> The unpack mode is off by default. Host containment is not: in this build guest sockets, DNS, windows,
+> audio and the GPU and Steam bridges never reach the host, with or without `SOGEN_UNPACK`.
+> `SOGEN_ALLOW_NETWORK=1` restores the network.
 > For anything that is not vmpunpack-specific, go upstream; issues here are not upstream's problem.
 
 <h1 align="center">

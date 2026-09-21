@@ -32,16 +32,11 @@ jobs:
         with:
           arch: x64
 
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-
-      # The root CMakeLists runs the Steam-bridge generator at configure time.
-      - name: Install libclang
-        run: python -m pip install --disable-pip-version-check libclang
-
+      # The Steam bridge is off on this branch (cmake/steam-bridge.cmake); it is passed explicitly so a
+      # change of that default cannot put the host Steam backend back into a release unnoticed. With it
+      # off, configure does not run the libclang-based generator or fetch Valve's Proton repository.
       - name: Build
-        run: cmake --preset=release && cmake --build --preset=release
+        run: cmake --preset=release -DSOGEN_ENABLE_STEAM=OFF && cmake --build --preset=release
 
       - name: List build artifacts
         shell: pwsh
@@ -113,14 +108,45 @@ jobs:
           $bytes = [IO.File]::ReadAllBytes("pkg/analyzer.exe")
           $text  = [Text.Encoding]::ASCII.GetString($bytes)
           $want  = @("SOGEN_UNPACK", "SOGEN_STOP_AT_OEP", "SOGEN_OEP_RVA", "SOGEN_LATEDUMP_AT",
-                     "SOGEN_NODELAY", "SOGEN_TSC_STRIDE",
-                     "C:\dumps\unpacked.bin", "C:\dumps\unpacked.meta", "[UNPACK] OEP=")
+                     "SOGEN_NODELAY", "SOGEN_TSC_STRIDE", "SOGEN_ALLOW_NETWORK",
+                     "C:\dumps\unpacked.bin", "C:\dumps\unpacked.meta", "[UNPACK] OEP=",
+                     "[UNPACK] host network: blocked")
           $missing = @($want | Where-Object { -not $text.Contains($_) })
           foreach ($w in $want) {
             "{0,-28} {1}" -f $w, $(if ($text.Contains($w)) { "present" } else { "MISSING" })
           }
           if ($missing.Count) { throw "built analyzer.exe is missing: $($missing -join ', ')" }
           "all patch markers present"
+
+          # The host bridges are closed by not being there: nothing references the Steam backend, the
+          # Vulkan host or SDL, so the linker drops them. One of these strings coming back means a
+          # bridge is linked again. Compared without regard to case, since an import table need not
+          # spell a DLL the way the source does. "SDL_" covers SDL whatever the runner's SDK makes it
+          # import; "GameInput.dll" is the import it pulled in on the build this was written against.
+          $absent = @("steamclient64.dll", "SOGEN_STEAMCLIENT", "SteamAPI", "vulkan-1.dll", "vkCreateInstance",
+                      "SDL_", "GameInput.dll")
+          $has = { param($w) $text.IndexOf($w, [StringComparison]::OrdinalIgnoreCase) -ge 0 }
+          foreach ($w in $absent) {
+            "{0,-28} {1}" -f $w, $(if (& $has $w) { "PRESENT" } else { "absent" })
+          }
+          $leaked = @($absent | Where-Object { & $has $_ })
+          if ($leaked.Count) { throw "built analyzer.exe still links a host bridge: $($leaked -join ', ')" }
+          "no host bridge is linked"
+
+      # The strings above prove that SOGEN_ALLOW_NETWORK is read, not which way the condition points.
+      # This runs a benign guest against a listener on the runner's loopback, using the packaged files:
+      # reached with SOGEN_ALLOW_NETWORK=1, not reached otherwise.
+      - name: Verify the guest's network is blocked by default
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest https://sogen.dev/root.zip -OutFile root.zip
+          New-Item -ItemType Directory -Force emu | Out-Null
+          tar -xf root.zip -C emu
+          if ($LASTEXITCODE) { throw "could not extract the emulation root" }
+          $root = if (Test-Path emu/root/registry) { "emu/root" } else { "emu" }
+          python .github/vmpunpack-nettest.py --analyzer pkg --root $root
+          if ($LASTEXITCODE) { throw "the network containment check failed" }
 
       - uses: actions/upload-artifact@v7
         with:
