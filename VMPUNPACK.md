@@ -20,8 +20,9 @@ defects found reviewing them and add the release build.
 | 4 | `emulator`: `SOGEN_NODELAY`, `SOGEN_TSC_STRIDE` | Collapse anti-sandbox sleeps and rdtsc delay loops. |
 | 5 | `emulator`: `SOGEN_UNPACK` — stop at OEP and dump the image | The core: arm an execution hook on the target's original code section, and on first hit dump the fully unpacked image plus its metadata. |
 | 6 | `emulator`: host containment, `SOGEN_ALLOW_NETWORK` | Upstream forwards guest sockets and DNS to the host's network stack, guest windows and audio to the host desktop, and two paravirtual devices to the host's Vulkan driver and Steam client. This build is pointed at live malware, so all of that is closed. See [Host containment](#host-containment). |
+| 7 | `syscalls`: `\KnownDlls` is `\KnownDlls32` to a WOW64 process | 32-bit code that opens `\KnownDlls\ntdll.dll` was handed the 64-bit ntdll, mapped above 4 GB. VMProtect's 32-bit runtime does exactly that to compare a clean ntdll against the one in memory; the mismatch ended the run with `Initialization error 3` before any unpacking. |
 
-Topics 2 through 6 are independent of each other; 1 is a host-compatibility fix that only affects
+Topics 2 through 7 are independent of each other; 1 is a host-compatibility fix that only affects
 startup.
 
 ## Environment variables

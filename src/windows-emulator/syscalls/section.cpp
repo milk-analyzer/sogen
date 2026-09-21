@@ -300,7 +300,11 @@ namespace sogen
 
             if (is_knowndll)
             {
-                bool is_knowndll32 = attributes.RootDirectory == KNOWN_DLLS32_DIRECTORY ||
+                // The object manager resolves \KnownDlls as \KnownDlls32 for a WOW64 process, so 32-bit code
+                // that names \KnownDlls outright gets the 32-bit DLL. Protectors do exactly that to map a
+                // clean ntdll and compare it against the one in memory; handed the 64-bit file instead, the
+                // comparison fails and the sample refuses to run.
+                bool is_knowndll32 = c.proc.is_wow64_process || attributes.RootDirectory == KNOWN_DLLS32_DIRECTORY ||
                                      utils::string::starts_with_ignore_case(filename_sv, u"\\KnownDlls32\\"sv);
 
                 std::u16string knowndll_name = filename;

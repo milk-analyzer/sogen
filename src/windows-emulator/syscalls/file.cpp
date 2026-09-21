@@ -2141,7 +2141,8 @@ namespace sogen
 
             if (object_name == u"\\KnownDlls")
             {
-                directory_handle.write(KNOWN_DLLS_DIRECTORY);
+                // \KnownDlls is \KnownDlls32 to a WOW64 process; see handle_NtOpenSection.
+                directory_handle.write(c.proc.is_wow64_process ? KNOWN_DLLS32_DIRECTORY : KNOWN_DLLS_DIRECTORY);
                 return STATUS_SUCCESS;
             }
 
