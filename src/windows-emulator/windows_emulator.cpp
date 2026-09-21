@@ -13,6 +13,7 @@
 #include "syscall_dispatcher.hpp"
 
 #include "network/static_socket_factory.hpp"
+#include "network/offline_socket_factory.hpp"
 #include "memory_permission_ext.hpp"
 
 namespace sogen
@@ -626,11 +627,69 @@ namespace sogen
             return std::make_unique<utils::clock>();
         }
 
+        // This build runs live malware, so by default nothing the guest does reaches the host's network:
+        // sockets go nowhere and names do not resolve. SOGEN_ALLOW_NETWORK=1 restores upstream's behaviour.
+        // The value is compared exactly - a presence test would make SOGEN_ALLOW_NETWORK=0 switch it on.
+        // Read once: the socket factory, the resolver and the startup line must not be able to disagree.
+        bool host_network_allowed()
+        {
+            static const bool allowed = [] {
+                const char* value = std::getenv("SOGEN_ALLOW_NETWORK");
+                return value != nullptr && std::string_view(value) == "1";
+            }();
+            return allowed;
+        }
+
+        // No name resolves except the one a machine resolves without a network. The resolver port reports
+        // the query before asking, so the name the guest wanted is still recorded.
+        struct offline_dns_lookup final : network::dns_lookup
+        {
+            std::vector<network::address> resolve_host(const std::string_view hostname, const std::optional<int> family) override
+            {
+                auto name = std::string(hostname);
+                if (!name.empty() && name.back() == '.')
+                {
+                    name.pop_back();
+                }
+
+                utils::string::to_lower_inplace(name);
+                if (name != "localhost")
+                {
+                    return {};
+                }
+
+                std::vector<network::address> results{};
+                if (!family || *family == AF_INET)
+                {
+                    network::address loopback{};
+                    loopback.set_ipv4(htonl(INADDR_LOOPBACK));
+                    results.push_back(loopback);
+                }
+
+                if (!family || *family == AF_INET6)
+                {
+                    in6_addr v6{};
+                    v6.s6_addr[15] = 1;
+
+                    network::address loopback{};
+                    loopback.set_ipv6(v6);
+                    results.push_back(loopback);
+                }
+
+                return results;
+            }
+        };
+
         std::unique_ptr<network::dns_lookup> get_dns_lookup(emulator_interfaces& interfaces)
         {
             if (interfaces.dns_lookup)
             {
                 return std::move(interfaces.dns_lookup);
+            }
+
+            if (!host_network_allowed())
+            {
+                return std::make_unique<offline_dns_lookup>();
             }
 
             return std::make_unique<network::dns_lookup>();
@@ -646,6 +705,11 @@ namespace sogen
 #ifdef OS_EMSCRIPTEN
             return network::create_static_socket_factory();
 #else
+            if (!host_network_allowed())
+            {
+                return network::create_offline_socket_factory();
+            }
+
             return std::make_unique<network::socket_factory>();
 #endif
         }
@@ -657,7 +721,14 @@ namespace sogen
                 return std::move(interfaces.ui);
             }
 
+#ifdef OS_EMSCRIPTEN
             return create_default_ui_backend();
+#else
+            // Not the host desktop: the default backend turns guest windows into real ones, with a
+            // guest-chosen title and pixels, and feeds host keyboard and mouse input back to the guest.
+            // The web build keeps upstream's backend; its host is a browser tab.
+            return std::make_unique<null_ui_backend>();
+#endif
         }
 
         std::unique_ptr<audio_backend> get_audio_backend(emulator_interfaces& interfaces)
@@ -667,7 +738,12 @@ namespace sogen
                 return std::move(interfaces.audio);
             }
 
+#ifdef OS_EMSCRIPTEN
             return create_default_audio_backend();
+#else
+            // Nor the host's speakers.
+            return std::make_unique<null_audio_backend>();
+#endif
         }
 
         // The guest must see at least as many logical processors as there are vCPUs, otherwise a
@@ -712,6 +788,18 @@ namespace sogen
           instruction_precision_(settings.use_instruction_precision && this->emu_->supports_instruction_counting()),
           vcpu_count_(static_cast<uint32_t>(this->emu_->vcpu_count()))
     {
+        // Said here rather than where the choice is made, because the logger is constructed after the
+        // members that hold the socket factory and the resolver - and first, so that a constructor that
+        // fails further down has still stated it.
+        if (host_network_allowed())
+        {
+            this->log.error("[UNPACK] host network: LIVE (SOGEN_ALLOW_NETWORK=1) - guest sockets and DNS use the real network\n");
+        }
+        else if (std::getenv("SOGEN_UNPACK") != nullptr)
+        {
+            this->log.error("[UNPACK] host network: blocked\n");
+        }
+
         if (this->vcpu_count_ == 0)
         {
             throw std::invalid_argument("At least one vCPU is required");

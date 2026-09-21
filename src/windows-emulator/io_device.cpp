@@ -102,8 +102,11 @@ namespace sogen
             {u"MountPointManager"sv, create_mount_point_manager},
             {u"KsecDD"sv, create_security_support_provider},
             {u"NamedPipe"sv, create_named_pipe_device},
-            {u"SogenGpu"sv, create_gpu_bridge},
-            {u"SogenSteam"sv, create_steam_bridge},
+            // Upstream's paravirtual bridges hand the guest the host's Vulkan driver and its logged-in
+            // Steam client. This build runs live malware: the names still open, because an unknown device
+            // ends the run, but every ioctl fails and neither host library is ever loaded.
+            {u"SogenGpu"sv, create_unsupported_io_device},
+            {u"SogenSteam"sv, create_unsupported_io_device},
             // AFD
             {u"Afd\\Endpoint"sv, create_afd_endpoint},
             {u"Afd\\AsyncConnectHlp"sv, create_afd_async_connect_hlp},

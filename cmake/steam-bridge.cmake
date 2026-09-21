@@ -5,7 +5,9 @@
 # a real Steam runs on (Windows, Linux, macOS) -- not the mobile/web targets. The Valve-licensed headers
 # are fetched, never committed.
 
-option(SOGEN_ENABLE_STEAM "Build the Steam bridge (fetches Proton SDK snapshots; needs the libclang pip package)" ON)
+# Off on this branch: the bridge proxies guest calls into the host's real Steam client, network included,
+# and vmpunpack points this build at live malware. With it off the host backend is never linked.
+option(SOGEN_ENABLE_STEAM "Build the Steam bridge (fetches Proton SDK snapshots; needs the libclang pip package)" OFF)
 set(SOGEN_STEAMWORKS_PROTON_REPO "https://github.com/ValveSoftware/Proton.git"
     CACHE STRING "Repo carrying vendored steamworks_sdk_* header snapshots")
 set(SOGEN_STEAMWORKS_PROTON_TAG "proton_11.0" CACHE STRING "Ref of SOGEN_STEAMWORKS_PROTON_REPO to fetch")

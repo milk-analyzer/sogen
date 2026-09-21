@@ -23,3 +23,6 @@ sogen_strip_target(analyzer)
 add_test(NAME analyzer-test
          COMMAND "${PYTHON3_EXE}" "${CMAKE_CURRENT_LIST_DIR}/../windows-analyzer/test.py"
          WORKING_DIRECTORY "$<TARGET_FILE_DIR:analyzer>")
+# Upstream's test sample resolves a public name and round-trips a loopback datagram through the host, which
+# this branch blocks by default.
+set_tests_properties(analyzer-test PROPERTIES ENVIRONMENT "SOGEN_ALLOW_NETWORK=1")

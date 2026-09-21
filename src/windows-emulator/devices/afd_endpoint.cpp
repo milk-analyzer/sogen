@@ -380,6 +380,11 @@ namespace sogen
             // otherwise wait forever on a packet that never arrives.
             bool non_blocking_{false};
 
+            // The last peer reported through on_generic_activity. A sample that sprays datagrams at one
+            // address is one fact for the analyst, not one report line per packet. Only consecutive repeats
+            // are dropped: alternating between two peers reports each change.
+            std::optional<network::address> reported_peer_{};
+
             afd_endpoint()
             {
                 network::initialize_wsa();
@@ -416,6 +421,37 @@ namespace sogen
                 }
 
                 this->s_->set_blocking(false);
+            }
+
+            // The address a sample tries to reach is often the only trace of its C2 - it is resolved or
+            // decrypted at run time and appears in no dump - so it is reported whether or not the network
+            // is there to answer.
+            void report_peer(windows_emulator& win_emu, const std::string_view operation, const network::address& peer)
+            {
+                if (this->executing_delayed_ioctl_ || (this->reported_peer_ && *this->reported_peer_ == peer))
+                {
+                    return;
+                }
+
+                this->reported_peer_ = peer;
+                win_emu.callbacks.on_generic_activity("Network " + std::string(operation) + ": " + peer.to_string());
+            }
+
+            // Without this "there is no network" and "nothing listens there" reach the guest as one generic
+            // failure, which mswsock turns into neither WSAENETUNREACH nor WSAECONNREFUSED.
+            static NTSTATUS translate_send_error(const int error)
+            {
+                if (error == SERR(ENETUNREACH))
+                {
+                    return STATUS_NETWORK_UNREACHABLE;
+                }
+
+                if (error == SERR(ECONNREFUSED))
+                {
+                    return STATUS_CONNECTION_REFUSED;
+                }
+
+                return STATUS_UNSUCCESSFUL;
             }
 
             void delay_ioctrl(const io_device_context& c, const std::optional<bool> require_poll = {},
@@ -644,6 +680,7 @@ namespace sogen
                 }
 
                 const auto addr = convert_to_host_address(win_emu, std::span(data).subspan(address_offset));
+                this->report_peer(win_emu, "connect", addr);
 
                 if (!this->s_->connect(addr))
                 {
@@ -659,7 +696,7 @@ namespace sogen
                         return STATUS_SUCCESS;
                     }
 
-                    return STATUS_UNSUCCESSFUL;
+                    return translate_send_error(error);
                 }
 
                 return STATUS_SUCCESS;
@@ -1189,6 +1226,7 @@ namespace sogen
 
                 const auto target = convert_to_host_address(win_emu, address_buffer);
                 const auto data = emu.read_memory(buffer.buf, buffer.len);
+                this->report_peer(win_emu, "sendto", target);
 
                 const auto sent_data = this->s_->sendto(target, data);
                 if (sent_data < 0)
@@ -1199,7 +1237,7 @@ namespace sogen
                         return this->pend_or_would_block(c, false);
                     }
 
-                    return STATUS_UNSUCCESSFUL;
+                    return translate_send_error(error);
                 }
 
                 if (c.io_status_block)
